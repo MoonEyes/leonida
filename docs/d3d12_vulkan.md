@@ -2431,9 +2431,7 @@ Pipeline creation:
   is when each is compiled alone, so a PSO released meanwhile waits for the submission. The workers have ended before
   the session cache is read at device teardown. `LEONIDA_PIPELINE_THREADS=<n>` sets the workers: unset, half the
   logical processors and at most 8; `0` compiles each pipeline on the submitting thread where `prepare()` meets it.
-  Graphics pipelines of 1 MiB of SPIR-V or more, and compute pipelines over 128 KiB (`LEONIDA_SERIAL_BIG_COMPILES`),
-  are compiled one after another beside the smaller ones, because a compile takes the driver some hundred bytes of
-  memory for each byte of SPIR-V ([pipeline_check.md](pipeline_check.md)); so are the variants of one PSO.
+  Large pipelines (below) are compiled within a memory budget, and the variants of one PSO one after another.
   `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile worker. Measured with synthetic programs
   never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Windows 11, 16 logical processors, 8 workers,
   three runs each): the first submission of 192 graphics pipelines takes 126 to 143 ms instead of 861 to 882, of 192
@@ -2441,6 +2439,27 @@ Pipeline creation:
   holds about 50 MiB more (the driver keeps memory for each thread that compiles). One `VkPipelineCache` is enough: one
   cache per thread, merged, was about as fast. Tested by `pipeline_workers`, `replay_pipeline_compiles` and
   `d3d12_pipeline_workers`.
+- Large pipelines: a compile takes the driver some hundred bytes of memory for each byte of SPIR-V
+  ([pipeline_check.md](pipeline_check.md), "Limiting concurrent compilation of large modules"), so compute modules over
+  128 KiB and graphics pipelines of 1 MiB or more compile side by side only while their estimates (512 bytes for each
+  byte of SPIR-V) fit a budget: three quarters of the smaller of the free RAM and the room under the commit limit, read
+  again whenever a place at the gate (`runtime/src/large_module_gate.h`, one for the process) is given or returned. One
+  always gets in when none is, so a pipeline larger than the budget compiles alone. An estimate counts in full until
+  the compile ends, although the driver has taken part of it by then. They get in in the order they came, the ones a
+  submission waits for (and those of `LEONIDA_ASYNC_PIPELINES`) before the warm-up's, which take a quarter of the
+  budget at most and none while a submission that has large ones is compiling on its workers. A thread that waits for
+  its place holds no PSO's lock, and one that has a place waits for none. `PipelineCompiles::build` gives a submission
+  as many jobs for large ones as its smallest could be in at once, largest first; where the next one does not fit, the
+  job compiles small ones in the meantime. `LEONIDA_SERIAL_BIG_COMPILES=1` compiles them one after another instead, as
+  before there was a budget, `=0` has no limit, `LEONIDA_BIG_COMPILE_BUDGET_MB` fixes the budget. Measured with
+  synthetic integer modules never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Ryzen 7 5800X3D, 8
+  workers and the submitting thread, three alternating runs each): the first submission of 16 modules of 256 KiB takes
+  0.8 s instead of 4.0 to 4.8 s, 16 of 512 KiB 2.0 to 2.2 s instead of 10.2 to 11.4, 15 of 1 MiB 5.8 to 6.1 s instead
+  of 29.2 to 31.2, 12 of 0.5 to 2 MiB 8.0 to 10.5 s instead of 38.9 to 39.9. While the 15 of 1 MiB compile, private
+  memory peaks 656 to 676 MiB over what it was, instead of 140 to 147 (one compile takes 85 to 131 bytes for each byte
+  of SPIR-V here, and the driver keeps memory for each thread that compiles). With a budget of 1536 MiB, two at once,
+  they take 18.5 s and peak 202 MiB over. Not measured: other drivers, and the title. Tested by `big_compile_gate`,
+  `replay_pipeline_compiles` and `d3d12_big_compute`.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

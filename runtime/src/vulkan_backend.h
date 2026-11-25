@@ -1569,6 +1569,14 @@ public:
         std::unique_lock lock(resource_mutex_);
         pipeline_workers_.swap(workers);
     }
+    // For the large pipelines of a submission: the memory they may use while they compile together
+    // (PipelineCompiles::build), and what is kept while they do (LargeModuleGate::Demand). None (the default): they compile
+    // one after another.
+    void set_large_compiles(std::function<std::uint64_t()> budget, std::function<std::shared_ptr<void>()> demand) {
+        std::unique_lock lock(resource_mutex_);
+        large_compile_budget_ = std::move(budget);
+        large_compile_demand_ = std::move(demand);
+    }
     PipelineWorkers::Stats pipeline_worker_stats() {
         std::shared_lock lock(resource_mutex_);
         return pipeline_workers_ ? pipeline_workers_->stats() : PipelineWorkers::Stats{};
@@ -2185,6 +2193,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::function<std::uint64_t()> large_compile_budget_;
+    std::function<std::shared_ptr<void>()> large_compile_demand_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -3121,11 +3131,15 @@ private:
             statistics_segments += prepared[i].statistics_segment_count;
             has_queries = has_queries || !prepared[i].queries.empty();
         }
+        std::shared_ptr<void> demand;
+        if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
         prepare_result = build_pipelines(
             compiles, std::span(prepared).first(lists.size()), prepare_result,
             [this](std::size_t count, const std::function<void(std::size_t)>& job) {
                 context_.pipeline_workers_->run(count, job);
-            });
+            },
+            context_.large_compile_budget_);
+        demand.reset();
         if (prepare_result != ReplayResult::success) return prepare_result;
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
