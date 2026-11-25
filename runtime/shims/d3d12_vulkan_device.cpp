@@ -61,6 +61,7 @@
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
+#include "../src/console_heap_vsharp_slots.h"
 #include "../src/title_window_plan.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
@@ -1448,7 +1449,7 @@ bool startup_cache_checkpoints_enabled() {
 
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false) {
+                                 bool checkpoint = false, const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
     auto limit = pipeline_cache_save_limit();
     // The output is an opaque Vulkan blob. A prefix is not an incremental cache.
@@ -1479,7 +1480,7 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
                     written <= size && staging.publish(path, written);
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=%s bytes=%zu query_us=%lld fill_us=%lld publish_us=%lld ok=%d result=%d\n",
-                     checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
+                     op ? op : checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
                      compile_us()-filled, int(ok), int(result));
     if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
     else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
@@ -3241,6 +3242,7 @@ struct DeviceState {
         std::vector<std::uint8_t> mirror;  // the title's bytes as the tracker last copied them
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
+        leonida::ConsoleHeapVsharpSlots live_vsharps;  // slots whose GPU copy holds a live buffer V#
         std::vector<std::uint32_t> retries;
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
@@ -3320,6 +3322,7 @@ struct DeviceState {
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
+        heap.live_vsharps.set(slot, leonida::ConsoleHeapVsharpSlots::is_live_vsharp(w));
         return settled;
     }
 
@@ -3351,6 +3354,7 @@ struct DeviceState {
                 heap.fix_over = true;
             if (heap.fix_over) {
                 std::memset(heap.copy + at, 0, kDescriptorSize);
+                heap.live_vsharps.clear(slot);
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
                     heap.retry[slot] = 1;
@@ -3436,6 +3440,7 @@ struct DeviceState {
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
             heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
             for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
+            heap.live_vsharps.clear_range(first, end);
         });
         const auto t1 = clock::now();
         heap.fix_start = t1;
@@ -3448,16 +3453,13 @@ struct DeviceState {
             heap.alias_generation = alias_generation;
             heap.checked_generation = generation;
             // Even an unchanged title slot may name a buffer released since the last submission.
-            for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
-                    const auto slot = at / kDescriptorSize;
-                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                        heap.retry[slot] = 1;
-                        heap.retries.push_back(uint32_t(slot));
-                    }
+            // Walk the host-RAM V# bitset instead of reading every slot of `heap.copy` (which may be uncached WC VRAM).
+            heap.live_vsharps.for_each([&](std::size_t slot) {
+                if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                    heap.retry[slot] = 1;
+                    heap.retries.push_back(uint32_t(slot));
                 }
-            }
+            });
         }
         const auto t2 = clock::now();
         // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
@@ -3675,6 +3677,7 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
+            heap->live_vsharps.reset(std::size_t(bytes / kDescriptorSize));
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }
@@ -10759,6 +10762,14 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
+// The live devices whose session pipeline cache an ending process writes (save_pipeline_caches_at_exit). A title
+// never releases its device, so ~Device, the only other writer, does not run in a real boot: without this, a run that
+// ends (normally, at a console close or in a crash) keeps none of what it compiled. Timed, so a crash handler that
+// finds it held gives up instead of hanging the process.
+std::timed_mutex exit_cache_mutex;
+std::vector<DeviceState*> exit_cache_devices;
+std::atomic<bool> exit_cache_saved{false};
+
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -10785,6 +10796,10 @@ public:
         // worker still has a warm-up to run is one too high. The proxy's count waits for the pool.
         rt::d3d12_xs::set_reference_settler([] { PipelineCompiler::instance().wait_idle(); });
         state_.info = info;
+        {
+            std::lock_guard lock(exit_cache_mutex);
+            exit_cache_devices.push_back(&state_);
+        }
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -11172,7 +11187,8 @@ public:
                                                           return state_.allocate(requirements, 0,
                                                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                                                                  nullptr, /*device_address=*/true);
-                                                      });
+                                                      },
+                                                      state_.families);
             }
         }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
@@ -11639,6 +11655,11 @@ public:
     }
 
     ~Device() override {
+        {
+            // Before anything goes: an exit save in progress finishes with this device first.
+            std::lock_guard lock(exit_cache_mutex);
+            std::erase(exit_cache_devices, &state_);
+        }
         leonida::value_sink::clear_arena(&state_);  // first: it waits for a value write into the arena in progress
         raw_images_.clear();
         geometry_refresher_.reset();  // its refresh uses state_.geometry
@@ -16971,6 +16992,60 @@ bool stop_pipeline_compiles(unsigned wait_ms) {
         std::fprintf(stderr, "[rt] d3d12: a background pipeline build was still running after %u ms at exit\n",
                      wait_ms);
     return idle;
+}
+
+// How long an exit save waits for the write itself (save_session_pipeline_cache): a 77 MiB cache was measured at about
+// 36 ms (fill and publish), so this only bounds a driver that blocks the read.
+constexpr unsigned kExitCacheWriteMs = 3000;
+
+bool save_pipeline_caches_at_exit(unsigned wait_ms) {
+    if (exit_cache_saved.exchange(true)) return false;  // once: a crash during the normal exit's save does not redo it
+    std::unique_lock lock(exit_cache_mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(wait_ms))) {
+        std::fprintf(stderr, "[rt] d3d12: device list busy for %u ms at exit; pipeline_cache.session.bin not written\n",
+                     wait_ms);
+        return false;
+    }
+    bool wrote = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    for (DeviceState* d : exit_cache_devices) {
+        if (!d->context || !d->pipeline_cache_handle) continue;
+        // A build still running (a large one takes minutes; at a crash the faulting thread may be inside one) is
+        // given until the deadline, then the cache is written without it. Unlike at teardown, the previous file is
+        // not kept instead: the process is ending, so waiting longer is not possible and keeping the old file throws
+        // away everything this run compiled (measured: a 1,308 s boot that ended in a title fault with 2 builds
+        // running). The cache is not created EXTERNALLY_SYNCHRONIZED, so reading it during a build is valid; the
+        // snapshot holds the pipelines finished so far.
+        while (d->active_compiles.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (const unsigned building = d->active_compiles.load())
+            std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at exit; writing the pipelines "
+                                 "finished so far\n", building);
+        // On a thread of its own: a driver that holds the cache until a build ends would otherwise hold the ending
+        // process too. Past the deadline the process goes on ending; the file is published by a rename
+        // (CacheStagingFile), so a write cut off there leaves the previous file whole.
+        struct Write {
+            std::mutex mutex;
+            std::condition_variable done_cv;
+            bool done = false;
+        };
+        auto write = std::make_shared<Write>();
+        std::thread([write, d] {
+            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+            std::lock_guard done_lock(write->mutex);
+            write->done = true;
+            write->done_cv.notify_all();
+        }).detach();
+        std::unique_lock write_lock(write->mutex);
+        if (!write->done_cv.wait_for(write_lock, std::chrono::milliseconds(kExitCacheWriteMs),
+                                     [&] { return write->done; })) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline cache still being written after %u ms at exit; the process "
+                                 "ends without waiting for it\n", kExitCacheWriteMs);
+            return wrote;  // the device list stays as it is: the write still uses this device
+        }
+        wrote = true;
+    }
+    return wrote;
 }
 
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
