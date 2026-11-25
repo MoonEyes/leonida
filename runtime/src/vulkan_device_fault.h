@@ -414,9 +414,19 @@ private:
                                  " precision=%" PRIu64 "\n",
                          i, int(address.addressType), address.reportedAddress, address.addressPrecision);
             if (address_binding_registry().enabled()) {
-                const auto owner = describe_address(address_binding_registry().lookup(address.reportedAddress));
-                std::fprintf(stderr, "[rt] device-fault: address[%zu] 0x%" PRIx64 " -> %s\n", i,
-                             address.reportedAddress, owner.c_str());
+                // The fault lies anywhere in [reported & ~(precision - 1), reported | (precision - 1)]
+                // (VkDeviceFaultAddressInfoEXT): look up both ends, preferring one that falls inside a binding.
+                const std::uint64_t precision = address.addressPrecision ? address.addressPrecision : 1;
+                const std::uint64_t low = address.reportedAddress & ~(precision - 1);
+                const std::uint64_t high = address.reportedAddress | (precision - 1);
+                auto found = address_binding_registry().lookup(low);
+                if (found.kind != AddressLookup::Kind::inside && high != low) {
+                    const auto upper = address_binding_registry().lookup(high);
+                    if (upper.kind == AddressLookup::Kind::inside) found = upper;
+                }
+                const auto owner = describe_address(found);
+                std::fprintf(stderr, "[rt] device-fault: address[%zu] [0x%" PRIx64 ", 0x%" PRIx64 "] -> %s\n", i,
+                             low, high, owner.c_str());
             }
         }
         for (std::size_t i = 0; i < counts.vendorInfoCount; ++i) {
