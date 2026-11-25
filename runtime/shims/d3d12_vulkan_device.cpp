@@ -1,4 +1,5 @@
 #include "../src/shader_directory.h"
+#include "../src/address_binding_registry.h"
 // A Vulkan-backed ID3D12Device (PC ABI) for the Xbox-ABI device proxy (d3d12_xs_device.cpp) to forward to.
 // Implemented: queues, allocators, command lists, fences, descriptor heaps, render-target and depth-stencil views,
 // committed buffers and textures (1D, 1D arrays, 2D, multisampled 2D, 3D) and their 1/2/3 variants, allocation
@@ -10663,7 +10664,31 @@ struct OwnedRuntime {
     PFN_vkDestroyInstance destroy_instance = nullptr;
     VkDevice device = VK_NULL_HANDLE;
     VkInstance instance = VK_NULL_HANDLE;
+    // LEONIDA_ADDRESS_BINDINGS=1: the messenger that feeds leonida::address_binding_registry(); gone before the instance.
+    VkDebugUtilsMessengerEXT address_messenger = VK_NULL_HANDLE;
+    PFN_vkDestroyDebugUtilsMessengerEXT destroy_address_messenger = nullptr;
 };
+
+// VK_EXT_device_address_binding_report delivers each bind/unbind of a GPU address range as a debug-utils message with
+// the range chained in and the object in pObjects. Nothing is logged; the registry answers the fault report.
+VKAPI_ATTR VkBool32 VKAPI_CALL address_binding_callback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+                                                        VkDebugUtilsMessageTypeFlagsEXT types,
+                                                        const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    if (!(types & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) || !data) return VK_FALSE;
+    for (auto* link = static_cast<const VkBaseInStructure*>(data->pNext); link; link = link->pNext) {
+        if (link->sType != VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) continue;
+        const auto& binding = *reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(link);
+        const std::uint32_t type = data->objectCount ? std::uint32_t(data->pObjects[0].objectType) : 0;
+        const std::uint64_t handle = data->objectCount ? data->pObjects[0].objectHandle : 0;
+        auto& registry = leonida::address_binding_registry();
+        if (binding.bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT)
+            registry.unbind(handle, binding.baseAddress, binding.size);
+        else
+            registry.bind(type, handle, binding.baseAddress, binding.size);
+        break;
+    }
+    return VK_FALSE;
+}
 
 class Device final
     : public Object<Device, ID3D12Device11Stubs, ID3D12Object, ID3D12Device, ID3D12Device1, ID3D12Device2,
@@ -11584,6 +11609,14 @@ public:
         state_.context.reset();
         state_.image_memory.reset();  // the context's deferred queue gave its ranges back
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
+        if (owned_.address_messenger) {
+            owned_.destroy_address_messenger(owned_.instance, owned_.address_messenger, nullptr);
+            auto& registry = leonida::address_binding_registry();
+            std::fprintf(stderr, "[rt] d3d12: address bindings: %llu bound, %llu unbound, %zu live\n",
+                         static_cast<unsigned long long>(registry.binds()),
+                         static_cast<unsigned long long>(registry.unbinds()), registry.size());
+            registry.set_enabled(false);
+        }
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
 
@@ -18307,6 +18340,34 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // LEONIDA_ADDRESS_BINDINGS=1: name the object that owns a fault address; off otherwise.
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+    bool address_bindings = false;
+    {
+        char want[2]{};
+        if (GetEnvironmentVariableA("LEONIDA_ADDRESS_BINDINGS", want, sizeof(want)) == 1 && want[0] == '1') {
+            const bool listed = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME) == 0;
+            });
+            if (listed && has_debug_utils) {
+                VkPhysicalDeviceAddressBindingReportFeaturesEXT supported{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+                VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &supported};
+                vkGetPhysicalDeviceFeatures2(info.physical, &query);
+                if (supported.reportAddressBinding) {
+                    address_binding.reportAddressBinding = VK_TRUE;
+                    address_binding.pNext = const_cast<void*>(device_info.pNext);
+                    device_info.pNext = &address_binding;
+                    device_extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+                    address_bindings = true;
+                }
+            }
+            if (!address_bindings)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_ADDRESS_BINDINGS=1 but VK_EXT_device_address_binding_report "
+                                     "(or VK_EXT_debug_utils) is unavailable; fault addresses are not attributed\n");
+        }
+    }
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};
@@ -18334,6 +18395,26 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
+    if (address_bindings) {
+        const auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            get(owned.instance, "vkCreateDebugUtilsMessengerEXT"));
+        owned.destroy_address_messenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            get(owned.instance, "vkDestroyDebugUtilsMessengerEXT"));
+        VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+        messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        messenger.pfnUserCallback = address_binding_callback;
+        if (create && owned.destroy_address_messenger &&
+            create(owned.instance, &messenger, nullptr, &owned.address_messenger) == VK_SUCCESS) {
+            leonida::address_binding_registry().set_enabled(true);
+            std::fprintf(stderr, "[rt] d3d12: VK_EXT_device_address_binding_report enabled (fault addresses are "
+                                 "attributed to the owning object)\n");
+        } else {
+            owned.address_messenger = VK_NULL_HANDLE;
+            std::fprintf(stderr, "[rt] d3d12: address binding messenger creation failed; fault addresses are not "
+                                 "attributed\n");
+        }
+    }
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
     const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));

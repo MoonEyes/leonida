@@ -2,6 +2,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "address_binding_registry.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -411,6 +413,11 @@ private:
             std::fprintf(stderr, "[rt] device-fault: address[%zu] type=%d address=0x%" PRIx64
                                  " precision=%" PRIu64 "\n",
                          i, int(address.addressType), address.reportedAddress, address.addressPrecision);
+            if (address_binding_registry().enabled()) {
+                const auto owner = describe_address(address_binding_registry().lookup(address.reportedAddress));
+                std::fprintf(stderr, "[rt] device-fault: address[%zu] 0x%" PRIx64 " -> %s\n", i,
+                             address.reportedAddress, owner.c_str());
+            }
         }
         for (std::size_t i = 0; i < counts.vendorInfoCount; ++i) {
             const auto& vendor = vendors[i];
