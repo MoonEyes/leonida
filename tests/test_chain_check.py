@@ -79,7 +79,8 @@ def make_work(root: str, *, llvm: str = "21.1.8", digest: str = "0" * 64, table:
     return root
 
 
-def runtime_log(path: str, *, slot_failures: int = 3, loaded: int = 10, encoding: str = "utf-8") -> str:
+def runtime_log(path: str, *, slot_failures: int = 3, loaded: int = 10, encoding: str = "utf-8",
+                extra: tuple = ()) -> str:
     lines = [f"[rt] d3d12: {loaded} translated shaders (6 fspx, 0 fspx_compute, 0 fspx_gfx, 0 bvh, 0 exe) from X",
              "[rt] d3d12: descriptor table: plain (all 10 modules)", TITLE_LINE]
     for i in range(slot_failures):
@@ -88,6 +89,7 @@ def runtime_log(path: str, *, slot_failures: int = 3, loaded: int = 10, encoding
     lines += [f"[rt] d3d12: compute pipeline library/{SECRET} (100 B SPIR-V, wave32) build starts at t=1.000 s",
               "[d3d12-trace] #7 ID3D12Device2::CreatePipelineState failed",
               "[d3d12-trace] #8 ID3D12Device2::CreatePipelineState ok",
+              *extra,
               "game exited with code 0"]
     with open(path, "w", encoding=encoding, newline="\n") as f:
         f.write("\n".join(lines) + "\n")
@@ -169,12 +171,146 @@ class ChainCheckTest(unittest.TestCase):
     def test_missing_translation_fails(self):
         work = make_work(os.path.join(self.root, "w"))
         os.remove(os.path.join(work, "shaders", "spirv", "library", "index.json"))
-        self.assertEqual(block(chain_check.check(work, probe=False), "library")["verdict"], "FAIL")
+        lib = block(chain_check.check(work, probe=False), "library")
+        self.assertEqual(lib["verdict"], "FAIL")
+        self.assertIn("never finished", lib["cause"])
+        write(os.path.join(work, "shaders", "spirv", "library", "shard0.json"), {"count": 1, "index": 0})
+        write(os.path.join(work, "shaders", "spirv", "library", "index.part0.json"), {})
+        lib = block(chain_check.check(work, probe=False), "library")
+        self.assertIn("translation in progress or interrupted (2 shard files)", lib["cause"])
+
+    def test_entry_without_module_is_not_translated(self):
+        work = make_work(os.path.join(self.root, "w"), library_ok=10)
+        os.remove(os.path.join(work, "shaders", "spirv", "library", f"{SECRET}_lib3.spv"))
+        lib = block(chain_check.check(work, probe=False), "library")
+        self.assertEqual((lib["translated"], lib["modules_missing"], lib["failed"]), (9, 1, 1))
+        self.assertEqual(lib["verdict"], "FAIL")
+
+    def test_threshold_bounds(self):
+        for ok, total, verdict in ((100, 100, "OK"), (99, 100, "WARN"), (198, 200, "WARN"), (197, 200, "FAIL")):
+            with self.subTest(ok=ok, total=total):
+                work = make_work(os.path.join(self.root, f"w{ok}_{total}"), library_ok=ok, library_total=total)
+                self.assertEqual(block(chain_check.check(work, probe=False), "library")["verdict"], verdict)
+
+    def test_more_modules_than_programs_warns(self):
+        work = make_work(os.path.join(self.root, "w"), library_ok=10)
+        spirv = os.path.join(work, "shaders", "spirv", "library")
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        for i in range(10):
+            index[f"extra{i}"] = {"stage": "cs"}
+            write(os.path.join(spirv, f"extra{i}.spv"), b"\x00")
+        write(os.path.join(spirv, "index.json"), index)
+        lib = block(chain_check.check(work, probe=False), "library")
+        self.assertEqual((lib["verdict"], lib["translated"], lib["expected"]), ("WARN", 20, 10))
+        self.assertIn("more modules than unpacked programs", lib["cause"])
+
+    def test_no_llvm_record_renders_na(self):
+        work = make_work(os.path.join(self.root, "w"))
+        os.remove(os.path.join(work, "shaders", "dxbc", "disasm.done"))
+        write(os.path.join(work, "shaders", "spirv", "library", "library_build.json"), {"translator": "0" * 64})
+        tools = block(chain_check.check(work, probe=False), "tools")
+        self.assertEqual((tools["verdict"], tools["llvm_mc_amdgpu"]), ("FAIL", None))
+        self.assertIn("amdgcn n/a, via n/a", self.printed(work))
 
     def test_utf16_log(self):
         work = make_work(os.path.join(self.root, "w"))
-        log = runtime_log(os.path.join(self.root, "run.log"), encoding="utf-16")
-        self.assertEqual(block(chain_check.check(work, log, probe=False), "runtime")["no_translated_compute"], 3)
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+            with self.subTest(encoding=encoding):
+                log = runtime_log(os.path.join(self.root, f"run-{encoding}.log"), encoding=encoding)
+                rt = block(chain_check.check(work, log, probe=False), "runtime")
+                self.assertEqual((rt["no_translated_compute"], rt["loaded"]["total"]), (3, 10))
+
+    def test_trace_and_digest_names_are_closed(self):
+        work = make_work(os.path.join(self.root, "w"))
+        log = runtime_log(os.path.join(self.root, "run.log"), extra=(
+            "[d3d12-trace] #9 PS_Secret_deadbeef failed",
+            f"[d3d12-trace] #10 {SECRET}::Create failed",
+            "[d3d12-trace] #11 XboxID3D12Fence::Slot12 failed"))
+        write(os.path.join(self.root, "run.digest.txt"), f"== boot run: {SECRET} ran its full time limit\n")
+        rt = block(chain_check.check(work, log, probe=False), "runtime")
+        self.assertEqual(rt["d3d12_problems"], {"(other) failed": 2, "ID3D12Device2::CreatePipelineState failed": 1,
+                                                "XboxID3D12Fence::Slot12 failed": 1})
+        self.assertEqual(rt["ending"], "other")
+        for ending, code in (("ran its full time limit (783 s), stopped", 0),
+                             ("exited by itself after 12 s, exit code -1073741819 (0xc0000005)", 0),
+                             ("exited by itself after 12 s, exit code unknown", 0),
+                             ("digest of an earlier run (-DigestOnly)", 0)):
+            with self.subTest(ending=ending):
+                write(os.path.join(self.root, "run.digest.txt"), f"== boot run: {ending}\n")
+                rt = block(chain_check.check(work, log, probe=False), "runtime")
+                self.assertEqual((rt["ending"], rt["exit_code"]), (ending, code))   # the log's own exit line wins
+        self.assertNotIn(SECRET, self.printed(work, "--log", log))
+        self.assertNotIn("PS_Secret", self.printed(work, "--log", log, "--json"))
+
+    def test_digest_exit_code_without_log_exit_line(self):
+        work = make_work(os.path.join(self.root, "w"))
+        log = os.path.join(self.root, "run.log")
+        with open(log, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[rt] d3d12: 10 translated shaders (6 fspx, 0 fspx_compute, 0 fspx_gfx, 0 bvh, 0 exe) from X\n")
+        write(os.path.join(self.root, "run.digest.txt"),
+              "== boot run: exited by itself after 12 s, exit code -1073741819 (0xc0000005)\n")
+        rt = block(chain_check.check(work, log, probe=False), "runtime")
+        self.assertEqual((rt["exit_code"], rt["verdict"]), (-1073741819, "FAIL"))
+
+    def test_stall_lines_warn_and_faults_fail(self):
+        work = make_work(os.path.join(self.root, "w"), llvm="23.1.5", digest=chain_check.repo_translation_digest(),
+                         table="tagged", library_ok=10)
+        stall = ("[rt] device-fault: enabled (fault info on, checkpoints on, NVIDIA diagnostics config off)",
+                 "[rt] device-fault: submitted dispatch seq=1 execute=2 groups=1,1,1")
+        log = runtime_log(os.path.join(self.root, "stall.log"), slot_failures=0, loaded=14, extra=stall)
+        rt = block(chain_check.check(work, log, probe=False), "runtime")
+        self.assertEqual((rt["stalled_dispatch_lines"], rt["device_fault_lines"], rt["verdict"]), (1, 0, "WARN"))
+        self.assertIn("device lost, faulted or stalled", rt["cause"])
+        log = runtime_log(os.path.join(self.root, "lost.log"), slot_failures=0, loaded=14,
+                          extra=("[rt] device-fault: VK_ERROR_DEVICE_LOST from vkQueueSubmit2",))
+        rt = block(chain_check.check(work, log, probe=False), "runtime")
+        self.assertEqual((rt["device_lost_lines"], rt["device_fault_lines"], rt["verdict"]), (1, 1, "FAIL"))
+
+    def test_descriptor_table_lines(self):
+        work = make_work(os.path.join(self.root, "w"))
+        cases = (("[rt] d3d12: descriptor table: 3 tagged / 2 plain modules; using tagged",
+                  "tagged (3 tagged / 2 plain)"),
+                 ("[rt] d3d12: descriptor table: plain (LEONIDA_DESCRIPTOR_TABLE; 3 tagged / 2 plain modules)",
+                  "plain forced by LEONIDA_DESCRIPTOR_TABLE (3 tagged / 2 plain)"))
+        for line, expected in cases:
+            with self.subTest(line=line):
+                log = runtime_log(os.path.join(self.root, "t.log"), extra=(line,))
+                self.assertEqual(block(chain_check.check(work, log, probe=False), "runtime")["descriptor_table"],
+                                 expected)
+
+    def test_runtime_sources_still_print_what_the_regexes_read(self):
+        # Every runtime line the report counts, pinned to the source that prints it: a reworded message would make
+        # its count fall to 0 and the runtime block pass in silence.
+        pins = {
+            "runtime/shims/d3d12_xs_device.cpp": ["[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx"],
+            "runtime/shims/d3d12_vulkan_device.cpp": [
+                "[rt] d3d12: %zu translated shaders (%zu fspx, %zu fspx_compute, ",
+                "%zu fspx_gfx, %zu bvh, %zu exe) from %s",
+                "[rt] d3d12: no translated compute shader for %s sha256",
+                "[rt] d3d12: compute pipeline %s (%zu B SPIR-V, %s) build starts at t=",
+                "[rt] d3d12: compute pipeline %s took %.1f s to build",
+                "[rt] d3d12: descriptor table: %s (all %zu modules)",
+                "[rt] d3d12: descriptor table: %zu tagged / %zu plain modules; using %s",
+                "[rt] d3d12: descriptor table: %s (LEONIDA_DESCRIPTOR_TABLE; %zu tagged / %zu plain modules)"],
+            "runtime/shims/d3d12_trace.h": ["[d3d12-trace] #%llu %s %s"],
+            "runtime/src/vulkan_device_fault.h": ["[rt] submit-lock: thread %u is waiting at the compile gate",
+                                                  "[rt] device-fault: submitted dispatch seq=",
+                                                  "[rt] device-fault: VK_ERROR_DEVICE_LOST from %s",
+                                                  "[rt] device-fault: enabled ("],
+            "runtime/src/main.cpp": ["game exited with code %d"],
+            "scripts/windows-boot/boot.ps1": ["== boot ${Name}: $verdict",
+                                              '$verdict = "digest of an earlier run (-DigestOnly)"',
+                                              '$verdict = "ran its full time limit ($ran s), stopped"',
+                                              '$verdict = "exited by itself after $ran s, exit code unknown"',
+                                              '"exited by itself after {0} s, exit code {1} (0x{2:x8})"'],
+        }
+        for rel, fragments in pins.items():
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                text = f.read()
+            for fragment in fragments:
+                with self.subTest(source=rel, fragment=fragment):
+                    self.assertIn(fragment, text)
 
     def test_no_names_or_log_text_printed(self):
         work = make_work(os.path.join(self.root, "w"))
@@ -205,10 +341,11 @@ class ChainCheckTest(unittest.TestCase):
                     "2  s_sethalt\n"
                     f"2  {SECRET} source\n"
                     f"1  E:\\work\\{SECRET}.s\n"
-                    "1  translator error KeyError\n")
+                    "1  translator error KeyError\n"
+                    "1  secret_program_name\n")
         lib = block(chain_check.check(work, probe=False), "library")
         self.assertEqual(dict((r, n) for n, r in lib["reasons"]),
-                         {"s_sethalt": 2, "# source": 2, "other": 1, "translator error KeyError": 1})
+                         {"s_sethalt": 2, "# source": 2, "other": 2, "translator error KeyError": 1})
 
     def test_empty_and_partial_folders_are_na(self):
         empty = os.path.join(self.root, "empty")

@@ -26,20 +26,28 @@ Verdicts (also in --help):
   GOOD_LLVM_MAJOR (23, the version #1923 measured reading the library), for families made with different llvm-mc
   versions or with another one than LLVM_MC names now, for a translation made by other translator sources than this
   checkout's (make_game.py's translation_sources_digest()), and for no spirv-val on PATH.
-* a family: OK when every unpacked program has a module; WARN when at most FAIL_FRACTION (1 %) of them have none;
-  FAIL above that, or with no readable index; n/a when the work folder does not hold that family.
+* a family: OK when every unpacked program has a module; WARN when at most FAIL_FRACTION (1 %) of them have none
+  (99 of 100 is WARN, 197 of 200 is FAIL) or when there are more modules than programs; FAIL above that, with no
+  readable index, or with no translated index (named "in progress or interrupted" when shard files are there); n/a
+  when the work folder does not hold that family. An index entry whose .spv is missing does not count as translated.
 * contract: WARN for mixed tagged and plain modules, for only plain modules when the translator's default is tagged
   (#2098), and for no fspx_compute/ while library programs are untranslated.
 * runtime: FAIL for a device loss or fault, a failed device slot call, no translated-shaders line or a non-zero exit
-  code; WARN for failed or unsupported D3D12 calls and for a loaded module count other than the work folder's.
+  code; WARN for "device-fault: submitted dispatch" lines alone (a stall prints them too), for failed or unsupported
+  D3D12 calls and for a loaded module count other than the work folder's. The log may be UTF-8 or UTF-16 with or
+  without a BOM (detected from its zero bytes).
 
 The weakest link is the first block, in chain order, with the worst verdict. The exit code is 0 whatever the
 verdicts (this is a report); --strict exits 1 when a block is FAIL. Bad arguments exit 2.
 
 It prints counts, verdicts, versions, short digests and the translator's and runtime's own fixed words, never a
-program name, a path or a log line (AGENTS.md, "No game data"): a refusal reason is printed only when it matches one
-of the messages rdna2spirv.py raises (read from its source), with each variable part kept only when it has the shape
-of an ISA mnemonic, and counted as "other" otherwise. The work folder and log paths appear only with --show-paths.
+program name, a path or a log line (AGENTS.md, "No game data"). Each free-text field is closed against the sources:
+a refusal reason is printed only when it matches one of the messages rdna2spirv.py raises (read from its source),
+each variable part kept only when it is an instruction of rdna2_isa_tables.py (encoding suffix _dpp, _sdwa, _e32 or
+_e64 removed) or a built-in exception name and printed as "#" otherwise, and the whole reason is "other" when it
+matches no message; a D3D12 trace method is printed only when it is a string literal of runtime/shims or
+runtime/src (or Interface::Method built from them), else "(other)"; boot.ps1's ending only in its three forms, else
+"other". The work folder and log paths appear only with --show-paths.
 Standard library only. It runs nothing heavy: with probing on (the default) it asks llvm-mc and spirv-val for
 --version, and git for the current commit; --no-probe runs nothing. A partial or empty work folder gives n/a blocks.
 """
@@ -47,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import functools
 import hashlib
 import json
@@ -92,22 +101,34 @@ DEFAULT_TABLE = re.compile(r'"--descriptor-table",\s*choices=DESCRIPTOR_TABLES,\
 LOADED = re.compile(r"\[rt\] d3d12: (\d+) translated shaders \((\d+) fspx, (\d+) fspx_compute, (\d+) fspx_gfx, "
                     r"(\d+) bvh, (\d+) exe\)")
 TABLE_ALL = re.compile(r"\[rt\] d3d12: descriptor table: (plain|tagged) \(all (\d+) modules\)")
-TABLE_MIX = re.compile(r"\[rt\] d3d12: descriptor table: (\d+) tagged / (\d+) plain modules")
+TABLE_MIX = re.compile(r"\[rt\] d3d12: descriptor table: (\d+) tagged / (\d+) plain modules; using (plain|tagged)")
+TABLE_FORCED = re.compile(r"\[rt\] d3d12: descriptor table: (plain|tagged) \(LEONIDA_DESCRIPTOR_TABLE; (\d+) tagged / "
+                          r"(\d+) plain modules\)")
 SLOT_FAIL = re.compile(r"\[rt\] d3d12_xs: slot (\d+) call \d+ failed with (0x[0-9a-fA-F]{8})")
 NO_COMPUTE = re.compile(r"\[rt\] d3d12: no translated compute shader for ")
 BUILD_START = re.compile(r"\[rt\] d3d12: compute pipeline \S+ \(\d+ B SPIR-V, [^)]*\) build starts")
 BUILD_SLOW = re.compile(r"\[rt\] d3d12: compute pipeline \S+ took [0-9.]+ s to build")
 TRACE = re.compile(r"\[d3d12-trace\] #\d+ (.+) (failed|unsupported|refused|partial)\s*$")
 GATE = re.compile(r"\[rt\] submit-lock: thread \d+ is waiting at the compile gate")
-FAULT = re.compile(r"\[rt\] device-fault: (?!enabled)")
+STALL = re.compile(r"\[rt\] device-fault: submitted dispatch ")   # also printed for a plain stall
+FAULT = re.compile(r"\[rt\] device-fault: (?!enabled|submitted dispatch )")
 LOST = re.compile(r"VK_ERROR_DEVICE_LOST")
 EXITED = re.compile(r"game exited with code (-?\d+)")
-METHOD = re.compile(r"^[A-Za-z0-9_:<>()# -]{1,80}$")
-# A variable part of a refusal reason is kept when it looks like an ISA mnemonic (s_sethalt, v_cmpx_eq_u32_dpp).
+# A trace method is printed only when it is a string literal of the runtime's sources, or Interface::Method /
+# Interface::Slot<N> built from one (d3d12_xs_device.cpp, child_trace_name()); anything else is "(other)".
+COMPOSED_METHOD = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)$")
+C_STRING = re.compile(r'"((?:[^"\\\n]|\\.){1,120})"')
+RUNTIME_SOURCE_DIRS = ("runtime/shims", "runtime/src")
+# A variable part of a refusal reason is kept only when it is an instruction of tools/rdna2_isa_tables.py (with a
+# _dpp, _sdwa, _e32 or _e64 encoding suffix removed first) or a built-in exception name; else it is "#".
 MNEMONIC = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
-EXCEPTION_NAME = re.compile(r"^[A-Z][A-Za-z]{2,40}Error$")
+ISA_NAME = re.compile(r"'([a-z][a-z0-9]*(?:_[a-z0-9]+)+)'")
+ISA_SUFFIX = re.compile(r"_(?:dpp|sdwa|e32|e64)$")
 UNSUPPORTED_CALL = re.compile(r"(?<![\w.])Unsupported\(")
-ENDING = re.compile(r"^[A-Za-z0-9 ().,;'-]{1,100}$")
+# The three verdicts scripts/windows-boot/boot.ps1 writes on its digest's first line; anything else is "other".
+ENDINGS = (re.compile(r"^ran its full time limit \(\d+ s\), stopped$"),
+           re.compile(r"^exited by itself after \d+ s, exit code (?:unknown|(-?\d+) \(0x[0-9a-f]{8}\))$"),
+           re.compile(r"^digest of an earlier run \(-DigestOnly\)$"))
 
 
 # ------------------------------------------------------------------------------------------------ reading helpers
@@ -127,12 +148,21 @@ def read_text(path: str) -> str | None:
         return None
 
 
-def log_lines(path: str):
-    """The lines of a log, UTF-8 or BOM-marked UTF-16 (PowerShell 5.1 redirection)."""
+def log_encoding(path: str) -> str:
+    """UTF-8, or UTF-16 with a BOM (PowerShell 5.1 redirection) or without one: ASCII text in UTF-16 has a zero in
+    every other byte, little-endian at the odd offsets."""
     with open(path, "rb") as f:
-        head = f.read(2)
-    encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8"
-    with open(path, encoding=encoding, errors="replace") as f:
+        head = f.read(4096)
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    if head.count(0) * 4 >= len(head) > 0:
+        return "utf-16-le" if head[1::2].count(0) >= head[0::2].count(0) else "utf-16-be"
+    return "utf-8"
+
+
+def log_lines(path: str):
+    """The lines of a log in the encoding log_encoding() finds."""
+    with open(path, encoding=log_encoding(path), errors="replace") as f:
         yield from f
 
 
@@ -150,6 +180,15 @@ def listing_count(folder: str) -> int | None:
             return sum(1 for e in entries if e.name.endswith(".s") and e.is_file() and e.stat().st_size > 0)
     except OSError:
         return None
+
+
+def shard_parts(spirv: str) -> int:
+    """The shard plans and index parts make_game.py's translate() leaves while a translation runs or once it stopped."""
+    try:
+        with os.scandir(spirv) as entries:
+            return sum(1 for e in entries if re.fullmatch(r"(?:shard\d+|index\.part\d+)\.json", e.name))
+    except OSError:
+        return 0
 
 
 def pct(part: int, whole: int) -> str:
@@ -268,9 +307,54 @@ def reason_templates(root: str = ROOT) -> tuple:
     return tuple(templates)
 
 
+@functools.lru_cache(maxsize=4)
+def isa_names(root: str = ROOT) -> frozenset:
+    """The instruction names of tools/rdna2_isa_tables.py (empty when it cannot be read)."""
+    try:
+        with open(os.path.join(root, "tools", "rdna2_isa_tables.py"), encoding="utf-8") as f:
+            return frozenset(ISA_NAME.findall(f.read()))
+    except (OSError, ValueError):
+        return frozenset()
+
+
+def known_value(value: str) -> bool:
+    """A variable part that may be printed: an ISA instruction of the decoder's tables or a built-in exception."""
+    if MNEMONIC.match(value) and ISA_SUFFIX.sub("", value) in isa_names():
+        return True
+    builtin = getattr(builtins, value, None)
+    return isinstance(builtin, type) and issubclass(builtin, BaseException)
+
+
+@functools.lru_cache(maxsize=4)
+def runtime_literals(root: str = ROOT) -> frozenset:
+    """Every short C string literal in the runtime's sources: the closed set a trace method name must come from."""
+    found = set()
+    for folder in RUNTIME_SOURCE_DIRS:
+        for dirpath, _, files in os.walk(os.path.join(root, folder)):
+            for name in files:
+                if name.endswith((".cpp", ".h", ".hpp", ".inl")):
+                    try:
+                        with open(os.path.join(dirpath, name), encoding="utf-8", errors="replace") as f:
+                            found.update(C_STRING.findall(f.read()))
+                    except OSError:
+                        continue
+    return frozenset(found)
+
+
+def trace_method(method: str) -> str:
+    """The method of a [d3d12-trace] line when the runtime's sources name it, else "(other)"."""
+    literals = runtime_literals()
+    if method in literals:
+        return method
+    m = COMPOSED_METHOD.match(method)
+    if m and m.group(1) in literals and (m.group(2) in literals or re.fullmatch(r"Slot\d{1,3}", m.group(2))):
+        return method
+    return "(other)"
+
+
 def normalize_reason(reason: str, templates: list) -> str:
-    """The reason when it is one of the translator's messages, each variable part kept only when it looks like an
-    ISA mnemonic or an exception name (else "#"); "other" for anything else."""
+    """The reason when it is one of the translator's messages, each variable part kept only when known_value() (else
+    "#"); "other" for anything else."""
     for regex, parts in templates:
         m = regex.match(reason)
         if not m:
@@ -280,7 +364,7 @@ def normalize_reason(reason: str, templates: list) -> str:
         for part in parts:
             if part is None:
                 value = next(values)
-                part = value if MNEMONIC.match(value) or EXCEPTION_NAME.match(value) else "#"
+                part = value if known_value(value) else "#"
             out.append(part)
         text = "".join(out)
         # A message that is only a variable part (Unsupported(op)) says nothing once that part is masked.
@@ -398,7 +482,8 @@ def tools_block(work: str, probe: bool) -> dict:
     return {"name": "tools", "verdict": verdict, "cause": "; ".join(causes) or "-",
             "_majors": {k: r["major"] for k, r in records.items()},
             "llvm_mc_recorded": dict(versions), "llvm_mc_records": len(records),
-            "llvm_mc_amdgpu": all(r["amdgpu"] for r in records.values()) if records else None,
+            "llvm_mc_amdgpu": (False if any(r["amdgpu"] is False for r in records.values()) else
+                               True if records and all(r["amdgpu"] for r in records.values()) else None),
             "llvm_mc_via": sorted({r["via"] or "native" for r in records.values()}),
             "llvm_mc_current": (current or {}).get("version") if probe else NA,
             "spirv_val": spirv_val if probe else NA,
@@ -438,11 +523,16 @@ def family_block(work: str, key: str, label: str, folder: str, spirv_sub: str, b
     if expected is None:
         block.update(verdict=FAIL, cause="no readable unpack index")
     elif translated is None:
-        block.update(verdict=FAIL, cause="no translated index (translation never finished)")
+        parts = shard_parts(spirv)
+        block.update(verdict=FAIL, cause=f"no translated index: translation in progress or interrupted ({parts} shard "
+                                         "files)" if parts else "no translated index (translation never finished)")
     else:
         failed = max(expected - translated, 0)
         block.update(failed=failed, percent=pct(translated, expected))
-        if failed == 0 and not no_module:
+        if translated > expected:
+            block.update(verdict=WARN, cause=f"{translated - expected} more modules than unpacked programs "
+                                             "(a translation from another unpack?)")
+        elif failed == 0 and not no_module:
             block.update(verdict=OK, cause="-")
         else:
             block["verdict"] = WARN if failed <= expected * FAIL_FRACTION and not no_module else FAIL
@@ -489,13 +579,16 @@ def runtime_block(path: str, families: list[dict]) -> dict:
     slots, trace = Counter(), Counter()
     counts = Counter()
     exit_code = None
+    try:
+        encoding = log_encoding(path)
+    except OSError:
+        encoding = None
     for line in _safe_lines(path):
         if "[rt]" not in line and "[d3d12-trace]" not in line and "VK_ERROR" not in line and "exited" not in line:
             continue
         m = TRACE.search(line)
         if m:
-            method = m.group(1) if METHOD.match(m.group(1)) else "(other)"
-            trace[f"{method} {m.group(2)}"] += 1
+            trace[f"{trace_method(m.group(1))} {m.group(2)}"] += 1
             continue
         if loaded is None and (m := LOADED.search(line)):
             loaded = dict(zip(("total", "fspx", "fspx_compute", "fspx_gfx", "bvh", "exe"), map(int, m.groups())))
@@ -509,12 +602,16 @@ def runtime_block(path: str, families: list[dict]) -> dict:
             counts["slow_compute_builds"] += 1
         elif GATE.search(line):
             counts["compile_gate_waits"] += 1
+        elif STALL.search(line):
+            counts["stalled_dispatch_lines"] += 1
         elif FAULT.search(line):
             counts["device_fault_lines"] += 1
         elif m := TABLE_ALL.search(line):
             table = m.group(1)
         elif m := TABLE_MIX.search(line):
-            table = f"{m.group(1)} tagged / {m.group(2)} plain"
+            table = f"{m.group(3)} ({m.group(1)} tagged / {m.group(2)} plain)"
+        elif m := TABLE_FORCED.search(line):
+            table = f"{m.group(1)} forced by LEONIDA_DESCRIPTOR_TABLE ({m.group(2)} tagged / {m.group(3)} plain)"
         if LOST.search(line):
             counts["device_lost_lines"] += 1
         if m := EXITED.search(line):
@@ -529,14 +626,21 @@ def runtime_block(path: str, families: list[dict]) -> dict:
     if digest:
         first = digest.splitlines()[0]
         ending = first.split(":", 1)[1].strip() if first.startswith("== boot") and ":" in first else None
-        if ending and not ENDING.match(ending):
-            ending = "other"
+        if ending:
+            matched = next((m for m in (e.match(ending) for e in ENDINGS) if m), None)
+            if not matched:
+                ending = "other"
+            elif exit_code is None and matched.groups() and matched.group(1) is not None:
+                exit_code = int(matched.group(1))
     local = sum(f.get("translated") or 0 for f in families)
     library = next((f for f in families if f["name"] == "library"), {})
     verdict, causes = OK, []
     if counts["device_lost_lines"] or counts["device_fault_lines"]:
         verdict = FAIL
-        causes.append("device lost or faulted")
+    if counts["device_lost_lines"] or counts["device_fault_lines"] or counts["stalled_dispatch_lines"]:
+        verdict = max(verdict, WARN, key=RANK.get)
+        causes.append(f"device lost, faulted or stalled (lost {counts['device_lost_lines']}, fault "
+                      f"{counts['device_fault_lines']}, stalled dispatch {counts['stalled_dispatch_lines']} lines)")
     if slots:
         verdict = FAIL
         worst, n = slots.most_common(1)[0]
@@ -550,7 +654,8 @@ def runtime_block(path: str, families: list[dict]) -> dict:
         causes.append(f"{failed_pso} D3D12 calls failed or unsupported")
     if loaded is None:
         verdict = FAIL
-        causes.append("no translated-shaders line (Vulkan device not reached?)")
+        causes.append("no translated-shaders line (Vulkan device not reached?)" if encoding else
+                      "the log could not be read")
     elif loaded["total"] != local:
         verdict = max(verdict, WARN, key=RANK.get)
         causes.append(f"loaded {loaded['total']} modules, the work folder holds {local} (another folder or build?)")
@@ -560,8 +665,10 @@ def runtime_block(path: str, families: list[dict]) -> dict:
     return {"name": "runtime", "verdict": verdict, "cause": "; ".join(causes) or "-", "loaded": loaded,
             "descriptor_table": table, "slot_failures": dict(slots.most_common(5)),
             "d3d12_problems": dict(trace.most_common(5)), "exit_code": exit_code, "ending": ending,
+            "log_encoding": encoding,
             **{k: counts[k] for k in ("no_translated_compute", "compute_builds", "slow_compute_builds",
-                                      "compile_gate_waits", "device_fault_lines", "device_lost_lines")}}
+                                      "compile_gate_waits", "device_fault_lines", "device_lost_lines",
+                                      "stalled_dispatch_lines")}}
 
 
 def check(work: str, log: str | None = None, probe: bool = True, show_paths: bool = False) -> dict:
@@ -598,8 +705,9 @@ def render(report: dict) -> str:
             pass
         elif b["name"] == "tools":
             recorded = fmt_counter(b["llvm_mc_recorded"], "in")
+            amdgcn = {True: "yes", False: "NO", None: "n/a"}[b["llvm_mc_amdgpu"]]
             out.append(f"  llvm-mc     recorded {recorded} ({b['llvm_mc_records']} records, "
-                       f"amdgcn {'yes' if b['llvm_mc_amdgpu'] else 'NO'}, via {'/'.join(b['llvm_mc_via'])}); "
+                       f"amdgcn {amdgcn}, via {'/'.join(b['llvm_mc_via']) or 'n/a'}); "
                        f"LLVM_MC now {b['llvm_mc_current'] or 'unreadable'}")
             out.append(f"  spirv-val   {b['spirv_val']}")
             local = fmt_counter(b["translator_local"], "in")
@@ -620,7 +728,7 @@ def render(report: dict) -> str:
             out.append(f"  pipelines   compute builds {b['compute_builds']} (slow {b['slow_compute_builds']}); "
                        f"compile gate waits {b['compile_gate_waits']}")
             out.append(f"  device      fault lines {b['device_fault_lines']}, device lost lines "
-                       f"{b['device_lost_lines']}; exit code "
+                       f"{b['device_lost_lines']}, stalled dispatch lines {b['stalled_dispatch_lines']}; exit code "
                        f"{'none logged' if b['exit_code'] is None else b['exit_code']}"
                        + (f"; boot.ps1: {b['ending']}" if b['ending'] else ""))
         else:
