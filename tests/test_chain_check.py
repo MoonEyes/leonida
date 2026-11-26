@@ -226,10 +226,11 @@ class ChainCheckTest(unittest.TestCase):
         log = runtime_log(os.path.join(self.root, "run.log"), extra=(
             "[d3d12-trace] #9 PS_Secret_deadbeef failed",
             f"[d3d12-trace] #10 {SECRET}::Create failed",
-            "[d3d12-trace] #11 XboxID3D12Fence::Slot12 failed"))
+            "[d3d12-trace] #11 XboxID3D12Fence::Slot12 failed",
+            "[d3d12-trace] #12 PS_Secret::Slot12 failed"))
         write(os.path.join(self.root, "run.digest.txt"), f"== boot run: {SECRET} ran its full time limit\n")
         rt = block(chain_check.check(work, log, probe=False), "runtime")
-        self.assertEqual(rt["d3d12_problems"], {"(other) failed": 2, "ID3D12Device2::CreatePipelineState failed": 1,
+        self.assertEqual(rt["d3d12_problems"], {"(other) failed": 3, "ID3D12Device2::CreatePipelineState failed": 1,
                                                 "XboxID3D12Fence::Slot12 failed": 1})
         self.assertEqual(rt["ending"], "other")
         for ending, code in (("ran its full time limit (783 s), stopped", 0),
@@ -283,7 +284,8 @@ class ChainCheckTest(unittest.TestCase):
         # Every runtime line the report counts, pinned to the source that prints it: a reworded message would make
         # its count fall to 0 and the runtime block pass in silence.
         pins = {
-            "runtime/shims/d3d12_xs_device.cpp": ["[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx"],
+            "runtime/shims/d3d12_xs_device.cpp": ["[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx",
+                                                  "[rt] d3d12_xs: slot 57 call %llu failed with 0x%08lx"],
             "runtime/shims/d3d12_vulkan_device.cpp": [
                 "[rt] d3d12: %zu translated shaders (%zu fspx, %zu fspx_compute, ",
                 "%zu fspx_gfx, %zu bvh, %zu exe) from %s",
@@ -342,10 +344,12 @@ class ChainCheckTest(unittest.TestCase):
                     f"2  {SECRET} source\n"
                     f"1  E:\\work\\{SECRET}.s\n"
                     "1  translator error KeyError\n"
+                    "1  translator error SecretError\n"
                     "1  secret_program_name\n")
         lib = block(chain_check.check(work, probe=False), "library")
         self.assertEqual(dict((r, n) for n, r in lib["reasons"]),
-                         {"s_sethalt": 2, "# source": 2, "other": 2, "translator error KeyError": 1})
+                         {"s_sethalt": 2, "# source": 2, "other": 2, "translator error KeyError": 1,
+                          "translator error #": 1})
 
     def test_empty_and_partial_folders_are_na(self):
         empty = os.path.join(self.root, "empty")

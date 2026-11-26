@@ -85,7 +85,9 @@ The last line names the weakest link: the first block, in chain order, with the 
 A family is FAIL when more than 1% of its programs have no module. An llvm-mc older than 23 is a WARN (#1923). The
 `--help` text lists every threshold. The report prints counts and fixed words only: no program names, no log lines
 and no paths. A refusal reason is printed only when it matches a message from `tools/rdna2spirv.py`; any other
-reason is counted as `other`. Add `--show-paths` to name the folder and the log, but not in a report you publish.
+reason is counted as `other`. A D3D12 method name is printed only when the runtime's sources contain it, and the
+end of a boot digest only in the forms boot.ps1 writes. Add `--show-paths` to name the folder and the log, but not
+in a report you publish.
 
 The exit code is `0` whatever the verdicts. With `--strict` it is `1` when a block is FAIL, and bad arguments exit
 `2`. Probing asks llvm-mc, spirv-val and git for their versions; `--no-probe` runs nothing.
