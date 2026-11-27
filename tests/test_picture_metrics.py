@@ -8,6 +8,7 @@ The frames are built in memory and written as PNG by the small encoder below (al
 import io
 import json
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -107,6 +108,15 @@ def blocks_frame(width, height, bw, bh, foreign, other=230):
         for y in range(by * bh, (by + 1) * bh):
             for x in range(bx * bw, (bx + 1) * bw):
                 lumas[y * width + x] = other
+    return lumas
+
+
+def sparse_dark_frame(width, height, count, seed, back=128):
+    """A plain grey frame with ``count`` dark pixels at places drawn from ``seed``."""
+    rng = random.Random(seed)
+    lumas = gray_frame(width, height, back)
+    for _ in range(count):
+        lumas[rng.randrange(height) * width + rng.randrange(width)] = 0
     return lumas
 
 
@@ -225,6 +235,35 @@ class Lattice(unittest.TestCase):
                             (gray_frame(64, 64, 4), 64, 64)):
             self.assertIsNone(pm.find_lattice(pm.luma(frame_of(lumas, w, h)), w, h))
 
+    def test_none_on_sparse_dark_pixels(self):
+        # A few dark pixels anywhere must not read as a lattice: a corner diagonal of one or two tiles covers
+        # fully at a large period, which is no repetition at all.
+        cases = [(256, 256, n, seed) for n in (8, 15, 50) for seed in range(10)]
+        cases += [(320, 180, n, seed) for n in (10, 20, 50) for seed in range(10)]
+        cases += [(640, 360, n, seed) for n in (20, 50) for seed in range(5)]
+        cases += [(1280, 720, n, seed) for n in (4, 50) for seed in range(2)]
+        for w, h, n, seed in cases:
+            with self.subTest(size=(w, h), pixels=n, seed=seed):
+                self.assertIsNone(pm.find_lattice(pm.luma(frame_of(sparse_dark_frame(w, h, n, seed), w, h)), w, h))
+
+    def test_none_on_noise_and_rows(self):
+        rng = random.Random(7)
+        noise = [min(255, max(0, round(rng.gauss(128, 30)))) for _ in range(256 * 256)]
+        self.assertIsNone(pm.find_lattice(pm.luma(frame_of(noise, 256, 256)), 256, 256))
+        rows = gray_frame(256, 256, 128)                                 # marks on every tile of rows 5 and 21
+        for y in range(256):
+            if (y // 8) % 16 == 5 and y % 8 < 4:
+                for x in range(256):
+                    if x % 8 + y % 8 < 4:
+                        rows[y * 256 + x] = 0
+        self.assertIsNone(pm.find_lattice(pm.luma(frame_of(rows, 256, 256)), 256, 256))
+
+    def test_recovers_through_noise(self):
+        rng = random.Random(3)
+        lumas = [min(255, max(0, v + rng.randint(-20, 20))) for v in lattice_frame(256, 256, 16, 7, "-", "TR")]
+        found = pm.find_lattice(pm.luma(frame_of(lumas, 256, 256)), 256, 256)
+        self.assertEqual((found["tile"], found["period"], found["phase"], found["diagonal"]), (8, 16, 7, "-"))
+
 
 class Blocks(unittest.TestCase):
     FOREIGN = ((1, 1), (2, 1), (5, 3), (3, 7), (6, 10), (1, 13), (4, 12), (4, 13))
@@ -245,6 +284,17 @@ class Blocks(unittest.TestCase):
     def test_none_on_plain_frames(self):
         for lumas in (gray_frame(128, 128, 128), smooth_frame(128, 128)):
             self.assertIsNone(pm.find_blocks(pm.luma(frame_of(lumas, 128, 128)), 128, 128))
+
+    def test_none_on_a_checkerboard_or_one_rectangle(self):
+        # A checkerboard texture has no picture around its squares; one sharp rectangle (a HUD panel) gives two
+        # edges a side, too few to tell a grid from the rectangle's own size.
+        board = [40 if (x // 8 + y // 8) % 2 else 200 for y in range(128) for x in range(128)]
+        self.assertIsNone(pm.find_blocks(pm.luma(frame_of(board, 128, 128)), 128, 128))
+        panel = smooth_frame(256, 256)
+        for y in range(100, 132):
+            for x in range(90, 150):
+                panel[y * 256 + x] = 230
+        self.assertIsNone(pm.find_blocks(pm.luma(frame_of(panel, 256, 256)), 256, 256))
 
 
 class Diff(unittest.TestCase):

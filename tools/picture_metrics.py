@@ -25,7 +25,11 @@ PPM/PGM (P6/P5, maxval 255). Anything else (palette, 16-bit, interlaced PNG, oth
 What it does not do: it does not look at what the scene contains, it does not write any file, and its output holds
 numbers and classes only: no pixel values beyond statistics, no image path (the path stays a local argument).
 The detectors are tuned on synthetic frames; on a real frame a scene edge on the grid or a dark texture on a
-diagonal can hide or fake them, so a class is a hint for a human to confirm.
+diagonal can hide or fake them, so a class is a hint for a human to confirm. A lattice needs 8 marked tiles on 3
+half-marked diagonals of its class, so a lattice cropped to fewer repeats is not reported. BLOCKS refuses one
+sharp rectangle and a checkerboard, but several sharp rectangles (HUD panels, window frames) can still read as
+BLOCKS, and blocks off the frame's origin are given at the divisor of their edges (16-pixel blocks shifted by 4
+read as 4x4): see ``find_blocks``.
 """
 from __future__ import annotations
 
@@ -45,12 +49,16 @@ DIFF_TILE = 8
 LATTICE_TILES = (4, 8, 16, 32)
 LATTICE_MAX_PERIOD = 32
 LATTICE_MIN_SCORE = 0.5       # cover of the diagonal minus the rate of marks off it
-LATTICE_MIN_TILES = 4
+LATTICE_MIN_TILES = 8         # marked tiles in the winning class, not in the whole frame
+LATTICE_MAX_OUTSIDE = 0.25   # the rate of marks off the diagonal stays under this share of its cover
+LATTICE_MIN_REPEATS = 3      # half-marked diagonals in the winning class: the pattern repeats at least this often
 NEAR_BEST = 0.9               # the smallest tile and period within this share of the best score win
 EDGE_JUMP = 8                 # a step across a block edge: at least this many luma levels ...
 EDGE_RATIO = 3                # ... and this many times the steps beside it
 MIN_LINE_ROWS = 4             # pixels on one grid line that must step for it to count
 MIN_BLOCK = 4
+MIN_EDGE_LINES = 3            # edge columns, and edge rows, a block grid needs
+MAX_BLOCK_SHARE = 0.5         # cut-off blocks are a minority: past this there is no picture around them
 TEXT_TILES = 16               # changed tiles listed in the text block (all of them in --json)
 
 MEASURED = ("BLACK-NEAR", "FLASH", "LATTICE", "BLOCKS", "OK")
@@ -291,16 +299,27 @@ def find_lattice(lumas: bytes, width: int, height: int) -> Optional[dict]:
             for tx, ty in marked:
                 hist[(tx + ty) if diagonal == "+" else (tx - ty + offset)] += 1
             for period in range(2, min(LATTICE_MAX_PERIOD, len(sizes)) + 1):
-                n_c, m_c = [0] * period, [0] * period
+                n_c, m_c, repeats = [0] * period, [0] * period, [0] * period
                 for s, size in enumerate(sizes):
                     c = (s - offset) % period
                     n_c[c] += size
                     m_c[c] += hist[s]
-                best = max(range(period), key=lambda c: (m_c[c] / n_c[c] if n_c[c] else -1.0, -c))
-                if not n_c[best] or n_c[best] == total:
+                    if hist[s] * 2 >= size:               # this diagonal is a repeat of the pattern
+                        repeats[c] += 1
+                # A class counts only with LATTICE_MIN_TILES marked tiles on LATTICE_MIN_REPEATS diagonals that
+                # are each half marked or more: one or two corner diagonals cover fully at a large period by
+                # chance, which is no repetition.
+                supported = [c for c in range(period) if n_c[c] and m_c[c] >= LATTICE_MIN_TILES
+                             and repeats[c] >= LATTICE_MIN_REPEATS]
+                if not supported:
+                    continue
+                best = max(supported, key=lambda c: (m_c[c] / n_c[c], -c))
+                if n_c[best] == total:
                     continue
                 cover = m_c[best] / n_c[best]
                 outside = (len(marked) - m_c[best]) / (total - n_c[best])
+                if outside > LATTICE_MAX_OUTSIDE * cover:     # marks everywhere: dark texture, not a lattice
+                    continue
                 candidates.append((cover - outside, tile, period, diagonal, best, m_c[best], cover))
     if not candidates:
         return None
@@ -361,18 +380,22 @@ def find_blocks(lumas: bytes, width: int, height: int) -> Optional[dict]:
     A grid line is an edge line when MIN_LINE_ROWS or more of its pixels step (see ``_steps``); the block width is
     the greatest common divisor of the edge columns and the height that of the edge rows (both at least
     MIN_BLOCK). On that grid a block edge is cut when half its pixels or more step; the blocks outside the largest
-    region joined by uncut edges are the blocks counted. A grid that only ever shows multiples of the true size
-    (every cut block on even positions) reads as the larger size.
+    region joined by uncut edges are the blocks counted.
+
+    Refused: fewer than MIN_EDGE_LINES edge lines on either axis (one sharp rectangle, such as a HUD panel, has two
+    a side, and the divisor of two positions is no grid), and a share over MAX_BLOCK_SHARE (a checkerboard texture:
+    no picture around the blocks). Still misread: a grid that only ever shows multiples of the true size (every
+    cut block on even positions) reads as the larger size; blocks off the frame's origin (a grid shifted by 4)
+    read at the divisor of their edges (4x4); several sharp rectangles on a few common divisors (HUD panels,
+    window frames) can read as BLOCKS.
     """
     cols = _steps(lumas, width, height, True)
     rows = _steps(lumas, width, height, False)
-    bw = bh = 0
-    for x, line in enumerate(cols):
-        if sum(line) >= MIN_LINE_ROWS:
-            bw = math.gcd(bw, x)
-    for y, line in enumerate(rows):
-        if sum(line) >= MIN_LINE_ROWS:
-            bh = math.gcd(bh, y)
+    edge_cols = [x for x, line in enumerate(cols) if sum(line) >= MIN_LINE_ROWS]
+    edge_rows = [y for y, line in enumerate(rows) if sum(line) >= MIN_LINE_ROWS]
+    if len(edge_cols) < MIN_EDGE_LINES or len(edge_rows) < MIN_EDGE_LINES:
+        return None
+    bw, bh = math.gcd(*edge_cols), math.gcd(*edge_rows)
     if bw < MIN_BLOCK or bh < MIN_BLOCK:
         return None
     nx, ny = width // bw, height // bh
@@ -397,7 +420,7 @@ def find_blocks(lumas: bytes, width: int, height: int) -> Optional[dict]:
         r = root(i)
         sizes[r] = sizes.get(r, 0) + 1
     cut = nx * ny - max(sizes.values())
-    if not cut:
+    if not cut or cut > MAX_BLOCK_SHARE * nx * ny:
         return None
     return {"width": bw, "height": bh, "blocks": cut, "of": nx * ny, "share": round(cut / (nx * ny), 4)}
 

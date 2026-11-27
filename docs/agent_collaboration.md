@@ -97,7 +97,9 @@ EVIDENCE: MEASURED (tools/picture_metrics.py, 2 frames)
 `STRAY-GEO`, `SMEAR` or `OK`. The tool measures the first four and `OK`; the other five need to know what the scene
 should show, so only a human gives them (`--class`, with `--region X,Y,W,H` for the numbers of the part concerned),
 and they print as `given`, never as `measured`. A measured class is a hint: a human confirms it before it is
-called a defect. Put the block next to the `RUN` block of the run that made the frame.
+called a defect. Several sharp rectangles (HUD panels, window frames) can read as `BLOCKS`, and blocks off the
+frame's origin are given at the divisor of their edges (16-pixel blocks shifted by 4 read as 4x4). Put the block
+next to the `RUN` block of the run that made the frame.
 
 A request for a test on a machine you do not have, as a comment on the pull request to test. With no pull request, it
 is its own issue titled `TEST-WANTED [<profile>] <one line>`, closed by its author when done, so that
