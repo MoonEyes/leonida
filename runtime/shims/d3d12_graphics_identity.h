@@ -1,8 +1,8 @@
 // The identity of a graphics pipeline description: a hash of what defines the pipeline and nothing of the run.
 //
 // pipeline_key (ID3D12PipelineState::GetCachedBlob, the `key=` of the pipeline-compile log line) is what the PC
-// runtime matches a CachedPSO against. It names the root signature, which the title builds in each run (its content,
-// or its address for an object that is not ours), it is not set on the stream creation path, and it has no MS or AS.
+// runtime matches a CachedPSO against. It names the root signature (its content, or its address for an object that is
+// not ours, which can differ between runs), it is not set on the stream creation path, and it has no MS or AS.
 // The identity below is for finding the same pipeline again in another run, so it takes none of those: the decoded
 // state blocks, the checksum of the shader of every stage, the formats and the topology the description declares.
 // The root signature, an address and a pointer are not in it. Nothing here reads a device or changes what is built.

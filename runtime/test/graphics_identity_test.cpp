@@ -95,6 +95,18 @@ int main() {
     check(hex64(reference), "the identity is 64 lowercase hex digits");
     check(id(Fixture{}) == reference, "two descriptions built the same way share an identity");
 
+    // Frozen values. key_graphics_state also feeds pipeline_key, whose hash names entries of a cache on disk: a
+    // field moved, widened or reordered there would orphan every user's cache without any other test noticing.
+    // The first value was computed with the code of main before the function was shared.
+    {
+        leonida::cached_pso::KeyBuilder state;
+        rt::d3d12::key_graphics_state(state, base.desc, true);
+        check(leonida::sha256_hex(state.data()) == "484d5f08252d7e0e80ca370520841e2b9fe2cc59306208e70508d60e841ac3e1",
+              "the bytes key_graphics_state feeds the cache key are the ones main hashed");
+        check(reference == "d2b87fb92c4fbc33728f50dde1c1011baa729388403a47fce753bad3282c367e",
+              "the identity of the reference description is the frozen one");
+    }
+
     // What is not part of the description: a copy of the bytecode elsewhere in memory, the root signature, flags,
     // a cached blob.
     {
