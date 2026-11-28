@@ -1,0 +1,107 @@
+name: Paquets de PR (mandy)
+
+# Read-only testing of ProjectLeonida/mandy pull requests, started by hand.
+# mode=paquet: each job merges one batch on upstream main and compares targeted tests.
+# mode=rougevert: each job checks the PRs of its list one by one (red on main, green merged).
+# Pull request code only runs inside Docker containers with no network, no token and no
+# .git (see .github/paquets/commun.py). Nothing is pushed, commented or merged anywhere.
+
+on:
+  workflow_dispatch:
+    inputs:
+      paquets:
+        description: 'JSON object: {"P1": "1318 1324 ...", "P2": "..."}'
+        required: true
+      mode:
+        description: 'paquet (batch merged together) or rougevert (each PR alone)'
+        required: true
+        default: paquet
+        type: choice
+        options: [paquet, rougevert]
+
+permissions:
+  contents: read
+
+jobs:
+  prep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          PAQUETS: ${{ inputs.paquets }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, re
+          data = json.loads(os.environ["PAQUETS"])
+          items = []
+          for name, prs in data.items():
+              if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", name):
+                  raise SystemExit(f"bad batch name: {name!r}")
+              if not re.fullmatch(r"[0-9 ]+", prs.strip()):
+                  raise SystemExit(f"bad PR list for {name}")
+              items.append({"name": name, "prs": " ".join(prs.split())})
+          print("matrix=" + json.dumps({"include": items}))
+          EOF
+
+  paquet:
+    needs: prep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.prep.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/paquets
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: PR states (the only step with a token; runs no PR code)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRS: ${{ matrix.prs }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess
+          states = {}
+          for n in os.environ["PRS"].split():
+              p = subprocess.run(["gh", "pr", "view", n, "--repo", "ProjectLeonida/mandy",
+                                  "--json", "state,isDraft,headRefOid"], capture_output=True, text=True)
+              if p.returncode == 0:
+                  states[n] = json.loads(p.stdout)
+          os.makedirs(os.path.join(os.environ["RUNNER_TEMP"], "work"), exist_ok=True)
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "work", "states.json"), "w") as f:
+              json.dump(states, f)
+          EOF
+      - name: Test image and dependencies (from upstream main)
+        run: |
+          cd "$RUNNER_TEMP/work"
+          docker pull -q python:3.13-bookworm
+          curl -fsSL --max-time 120 https://raw.githubusercontent.com/ProjectLeonida/mandy/main/tests/requirements.txt -o req.txt
+          mkdir -p deps
+          docker run --rm -v "$PWD:/w" python:3.13-bookworm pip install -q --target /w/deps -r /w/req.txt
+      - name: Batch ${{ matrix.name }}
+        env:
+          PRS: ${{ matrix.prs }}
+          NAME: ${{ matrix.name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          cd "$RUNNER_TEMP/work"
+          git config --global user.email "paquets@localhost"
+          git config --global user.name "paquets"
+          if [ "$MODE" = rougevert ]; then script=rougevert.py; else script=paquet.py; fi
+          PYTHONPATH="$GITHUB_WORKSPACE/.github/paquets" python "$GITHUB_WORKSPACE/.github/paquets/$script" \
+            --name "$NAME" --prs "$PRS" --states states.json --out "$RUNNER_TEMP/out"
+          cat "$RUNNER_TEMP/out/$NAME.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paquet-${{ matrix.name }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: warn
